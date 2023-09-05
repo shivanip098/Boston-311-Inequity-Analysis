@@ -1,0 +1,435 @@
+---
+title: "Boston 311 Inequity Analysis"
+---
+
+```{r packages and keys}
+library(tidyverse)
+library(sf)
+library(mapview)
+library(dplyr)
+library(tidyr)
+library(pbapply)
+library(ggmap)
+library(animation)
+library(leaflet)
+library(viridis)
+library(sqldf)
+library(vioplot)
+library(ggplot2)
+library(lubridate)
+library(GGally)
+#input personal key here
+#register_google(key = key)
+```
+
+For the first part of my data cleaning, I removed rows with null longitude and latitude values. I also found that some of the longitudes and latitudes were switched, so I iterated through the data frame and swapped the coordinates necessary. Then I found some points that were outliers compared to the majority of the longitude/latitude data. The differences were by 2 which is fairly significant for geographic data points.
+
+```{r 311}
+# Read in CSV data
+df<-read.csv('BOS311.csv')
+
+# see top 6 rows as well as column summary
+View(head(df))
+summary(df)
+
+# create df that has important columns
+mod_df<-df[c('CASE_ENQUIRY_ID', 'OPEN_DT', 'CLOSED_DT', 'TYPE', 'CLOSURE_REASON', 'latitude', 'longitude')]
+
+# clean data
+
+NA_df <- mod_df[rowSums(is.na(mod_df)) > 0,]
+
+#summary(NA_df)
+#view(head(NA_df, 10))
+
+# all rows in NA_df were missing coordinates and were largely unresolved cases
+#were removed as part of the cleaning process
+
+cleaning <- na.omit(mod_df)
+
+#cleaning now contains all of rows of mod_df that aren't missing long/lat values
+
+```
+
+There are some outlier values (swapped long/lat, etc) so those need to be removed
+
+```{r cleaning pt 2}
+
+for (i in 1:nrow(cleaning)) {
+  if (cleaning[i, "latitude"] < 0 || cleaning[i, "longitude"] > 0) {
+    tmp <- cleaning[i, "latitude"]
+    cleaning[i, "latitude"] <- cleaning[i, "longitude"]
+    cleaning[i, "longitude"] <- tmp
+  }
+}
+
+
+mean_col1 <- mean(cleaning$latitude)
+mean_col2 <- mean(cleaning$longitude)
+
+cleaning <- cleaning[abs(cleaning$latitude - mean_col1) <= 2 & abs(cleaning$longitude - mean_col2) <= 2, ]
+
+# this new variable will contain a sample of the original data frame if fewer instances are desired
+subset_df <- cleaning %>% sample_n(100000)
+
+# Convert OPEN_DT and CLOSED_DT to date-time objects
+cleaning$OPEN_DT <- as.POSIXct(cleaning$OPEN_DT, format = "%Y-%m-%d %H:%M")
+cleaning$CLOSED_DT <- as.POSIXct(cleaning$CLOSED_DT, format = "%Y-%m-%d %H:%M")
+
+# rewriting the df variable to contain the cleaned data
+df <- cleaning
+```
+
+As a means of making the 311 data more interpretable, I chose to create 3 new variables. The first variable is titled “case_duration” This takes the difference in time between the “CLOSED_DT” and “OPEN_DT” to show how long it took for a case to be addressed after it was initially reported. 
+
+```{r new: case duration}
+
+# Calculate case duration
+df$case_duration <- as.numeric(difftime(df$CLOSED_DT, df$OPEN_DT, units = "hours"))
+
+df <- df[!is.na(df$TYPE) & df$TYPE != "", ]
+
+summary(df)
+
+smallest_open_dt_index <- which.min(df$case_duration)
+smallest_open_dt_case <- df[smallest_open_dt_index, ]
+#View(smallest_open_dt_case)
+
+# Create a new variable for the month
+df$cl_month <- month(df$CLOSED_DT)
+df$op_month <- month(df$OPEN_DT)
+# Create a new variable for the hour
+df$cl_hour <- hour(df$CLOSED_DT)
+df$op_hour <- hour(df$OPEN_DT)
+
+#create new variable "closed"
+df$closed <- ifelse(grepl("case resolved", df$CLOSURE_REASON, ignore.case = TRUE), "yes", "no")
+```
+```{r t_test}
+
+# Conduct ANOVA comparing the case duration between neighborhoods
+fit <- aov(case_duration ~ neighborhood, data = df)
+summary(fit)
+
+t.test(df$case_duration, df$income_lvl, alternative = "two.sided", var.equal = FALSE)
+
+
+fit1 <- aov(case_duration ~ cl_month, data = df)
+summary(fit1)
+
+fit2 <- aov(case_duration ~ cl_hour, data = df)
+summary(fit2)
+```
+
+
+```{r type counts}
+
+#Just some extra visualizations for my own purposes (shows TYPE counts)
+incident_types_with_counts <- table(df$TYPE)
+View(incident_types_with_counts)
+
+largest_open_dt_index <- which.max(df$case_duration)
+largest_open_dt_case <- df[largest_open_dt_index, ]
+
+```
+
+By doing this, I gain more insight regarding the time needed to resolve cases and can tie this to when the report was created, the type of case, and where it took place, bringing me to my second new variable: “neighborhood”. For this variable, I took geospatial data from a public database which contains information regarding the boundaries of various Boston neighborhoods. By assigning each case to a neighborhood, it is easier to see if certain patterns emerge in specific areas. You can also see which areas are doing well with certain categories, and this information can be used to improve other neighborhoods.
+
+
+```{r new: neighborhoods}
+# read in the Boston neighborhood shapefile
+neighborhoods <- st_read("boston_neighborhoods.shp")
+
+# create a data frame with latitude and longitude coordinates
+# replace with your data
+my_data <- df[, c("longitude", "latitude")]
+
+# create a spatial points object from the latitude and longitude data
+my_points <- st_as_sf(my_data, coords = c("longitude", "latitude"), crs = 4326)
+
+# transform the CRS of the points to match the neighborhoods shapefile
+my_points <- st_transform(my_points, st_crs(neighborhoods))
+
+# use st_join to join the neighborhood polygons with the points
+my_points_with_neighborhoods <- st_join(my_points, neighborhoods)
+
+# the neighborhood name can be accessed as an attribute of the resulting object
+neighborhood_names <- my_points_with_neighborhoods$Name
+
+# check the length of neighborhood_names
+length(neighborhood_names)
+
+# remove any NA values
+neighborhood_names <- neighborhood_names[!is.na(neighborhood_names)]
+
+# remove any extra values
+neighborhood_names <- neighborhood_names[1:nrow(df)]
+
+# assign neighborhood_names to cleaning
+df$neighborhood <- neighborhood_names
+
+# view the new cleaning data frame with neighborhood names
+head(df)
+
+```
+
+As you can see here, the TYPE category is difficult to visualize due to the sheer number of types and reports:
+
+```{r all 88 types}
+# Count the frequency of each incident type
+incident_counts <- table(df$TYPE)
+
+# Sort the counts in descending order and select the top 15
+top15_incidents <- sort(incident_counts, decreasing = TRUE)[1:15]
+bot15_incidents <- sort(incident_counts, decreasing = FALSE)[1:15]
+
+# Create a data frame for the top 15 incidents
+top15_df <- data.frame(TYPE = names(top15_incidents), COUNT = as.numeric(top15_incidents))
+bot15_df <- data.frame(TYPE = names(bot15_incidents), COUNT = as.numeric(bot15_incidents))
+
+# Create the bar graph
+ggplot(top15_df, aes(x = reorder(TYPE, -COUNT), y = COUNT)) +
+  geom_bar(stat = "identity", fill = "royalblue") +
+  xlab("Incident Type") +
+  ylab("Frequency") +
+  ggtitle("Top 15 Most Frequent Incident Types") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggplot(bot15_df, aes(x = reorder(TYPE, -COUNT), y = COUNT)) +
+  geom_bar(stat = "identity", fill = "red") +
+  xlab("Incident Type") +
+  ylab("Frequency") +
+  ggtitle("15 Least Frequent Incident Types") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+The final variable I created was a more general “TYPE” category. The original dataset contained 88 “TYPE”s, making it difficult to plot data in regard to its subject. I did this by creating 6 general categories and manually assigning each of the 88 case types to one of the 6 general categories.
+
+
+```{r new: general_category}
+
+# create a vector of the types you want to map to each general category
+enviro_types <- c("Residential Trash out Illegally", "Litter", "Needle Clean-up", "Illegal Dumping", "Trash on Vacant Lot", "Recycling Cart", "Recycling Cart Return", "Overflowing Trash Can", "Litter Basket Maintenance", "CE Collection", "Missed Trash or Recycling", "Schedule a Bulk Item Pickup", "Dead Animal Pick-up", "Overflowing/Unkept Dumpster", "Litter Basket", "Construction Debris")
+infra_types <- c("Major System Failure", "Traffic Signal", "Pavement Marking Inspection", "Roadway Plowing/Salting", "Broken Sidewalk", "Catchbasin", "Traffic Signal Repair", "Sidewalk Cover / Manhole", "Utility Casting Repair", "Knockdown Replacement", "BWSC Pothole", "Bridge Maintenance", "Traffic Signal Studies", "Upgrade Existing Lighting", "Abandoned Building", "General Traffic Engineering Request", "Park Improvements", "Roadway Repair", "Street Light Knock Downs", "Damaged Sign", "MBTA Request", "General Lighting Request", "Park Lights", "Pothole", "Sidewalk", "Pavement Marking Maintenance", "New Sign, Crosswalk or Marking", "Planting")
+pub_safety_types <- c("Install New Lighting", "Street Lights", "Illegal Graffiti", "Abandoned Vehicle", "Broken Park Equipment", "Dead Tree Removal", "Abandoned Bicycle", "New Sign", "Crosswalk or Marking", "Fire Hydrant", "News Boxes", "Bicycle Issues", "Tree in Park", "Water in Gas (High Priority)", "Fire Department Request", "City/State Snow Issues", "Sidewalk (Internal)", "Sidewalk Not Shoveled", "Tree Emergencies", "New Tree Requests", "Tree Pruning", "Short Measure - Gas")
+parking_types <- c("Illegal Parking", "Space Savers", "Parking Front/Back Yards (Illegal)", "Parking Meter Repairs", "Valet Parking Problems", "Private Parking Lot Complaints", "Municipal Parking Lot Complaints", "Short Term Rental")
+other_types <- c("Other", "Rodent Sighting", "Pigeon Infestation", "Sticker Request", "Missing Sign", "Illegal Auto Body Shop", "Scanning Overcharge", "Item Price Missing", "No/Wrong Gas Price", "Product Short Measure", "Cemetery Maintenance Request", "Student Move-In Issues", "Unit Pricing Wrong/Missing", "Illegal Posting of Signs", "Scale Not Visible", "Aircraft Noise Disturbance")
+
+# use ifelse to map each type to its general category
+df$general_category <- ifelse(df$TYPE %in% enviro_types, "Environmental",
+                              ifelse(df$TYPE %in% infra_types, "Infrastructure",
+                                     ifelse(df$TYPE %in% pub_safety_types, "Public Safety",
+                                            ifelse(df$TYPE %in% parking_types, "Parking",
+                                                          ifelse(df$TYPE %in% other_types, "Other", "")))))
+
+```
+
+
+
+```{r table general category}
+
+# creates a table of the neighborhoods with the number of cases within each neighborhood, and the percent of each general report type within each neighborhood
+
+table = df %>%
+  group_by(neighborhood, general_category) %>%
+  summarize(n_reports = n()) %>%
+  group_by(neighborhood) %>%
+  mutate(total_reports = sum(n_reports)) %>%
+  pivot_wider(names_from = general_category, values_from = n_reports, 
+              names_prefix = "general_category_", values_fill = 0) %>%
+  mutate(across(starts_with("general_category"), ~ scales::percent(. / total_reports, accuracy = 1)),
+         total_reports = as.character(total_reports)) %>%
+  select(neighborhood, starts_with("general_category"), total_reports)
+
+View(table)
+
+```
+
+```{r chart general category}
+# Create a data frame with the counts of each general category
+type_counts <- as.data.frame(table(df$general_category))
+
+# Create a bar plot with labels
+ggplot(data = type_counts, aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label=Freq), vjust=1.6, color="white", size=3.5) +
+  labs(x = "General Category", y = "Count", title = "Counts of General Types")
+
+og_type_counts <- as.data.frame(table(cleaning$TYPE))
+
+# Create a bar plot with labels
+ggplot(data = og_type_counts, aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label=Freq), vjust=1.6, color="white", size=3.5) +
+  labs(x = "Category", y = "Count", title = "Counts of Types")
+
+```
+
+
+```{r Back Bay}
+
+# more EDA on the Back Bay and fenway neighborhoods (mid range case numbers)
+table_backbay <- table(df[df$neighborhood == "Back Bay", "TYPE"])
+table_backbay <- sort(table_backbay, decreasing = TRUE)
+#View(table_backbay)
+
+back_bay_data <- subset(df, neighborhood == "Back Bay")
+category_counts <- table(back_bay_data$general_category)
+pie(category_counts, main = "General Category for Back Bay", labels = paste(names(category_counts), ": ", category_counts))
+
+fenway_data <- subset(df, neighborhood == "Fenway")
+f_category_counts <- table(fenway_data$general_category)
+pie(f_category_counts, main = "General Category for Fenway", labels = paste(names(f_category_counts), ": ", f_category_counts))
+```
+
+
+```{r gen category map and report type map}
+
+# produces two maps of Boston Reports, one by general category and one by report type
+
+# creates plot by category
+ggplot(df, aes(x = longitude, y = latitude, color = general_category)) + 
+  geom_point() +
+  labs(title = "Reports by Category")
+
+
+# creates plot by type
+ggplot(df, aes(x = longitude, y = latitude, color = TYPE)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1") +
+  ggtitle("Reports by Type")
+          
+```
+
+
+One latent construct I would like to measure is pedestrian safety. While I would have liked to have focused on public safety, I found that most of the report types could directly or indirectly contribute to some aspect of safety. Pedestrian safety can tie to things such as the overall safety of a neighborhood, how accessible resources are for residents, building community, and more. While I was initially hesitant to focus on this latent construct due to potential reporting bias, I decided I wanted to know more about how this could correlate to the data if at all. Reporting bias could be caused by a lack of knowledge surrounding the 311 system, varying standards for what constitutes a report, and more.
+
+Prior to analyzing this dataset, I believed that 311 reports would be heavily skewed based on neighborhoods. After the first City Exploration, I found that each neighborhood had a pretty even distribution of issues based on the general categories I organized. I would do this by taking the report types, labeling the types that would be considered “risky” for residents, and counting the number of reports that fall into these types by neighborhood. Then I would use a metric (either population size or land size) and find out which areas are more dangerous according to the metric mentioned above. This construct is interesting to me because it can be used to determine how likely other incidents are in regions based on how “safe” they are. Because I would personally be categorizing the types, the bias would come from me. I can try to utilize AI resources and ask a random assortment of people also to organize the categories. Still, the AI would be biased based on the data it used to learn and the people I choose would also be a biased selection depending on how I found them. I think that it would also be interesting to observe based on the time of year to see if the school year impacts any of these metrics.
+
+To properly construct the latent variable, I surveyed several people to choose and rank report types by how dangerous the issue was to pedestrian safety, then took the average ratings for my purposes. I then used sqldf to create a new variable called "Pedestrian_Danger_Rating" 
+
+
+```{r Pedestrian Danger Rating}
+
+# Define the rating values as a named vector
+rating_values <- c("Pavement Marking Maintenance" = 1,
+                   "Catchbasin" = 1,
+                   "Bridge Maintenance" = 1,
+                   "Fire Hydrant" = 1,
+                   "Damaged Sign" = 2,
+                   "Park Lights" = 2,
+                   "Upgrade Existing Lighting" = 2,
+                   "Dead Animal Pick-up" = 2,
+                   "Pigeon Infestation" = 2,
+                   "Install New Lighting" = 2,
+                   "Roadway Repair" = 3,
+                   "Roadway Plowing/Salting" = 3,
+                   "Sidewalk Cover/Manhole" = 3,
+                   "Sidewalk (Internal)" = 3,
+                   "Sidewalk" = 3,
+                   "Pavement Marking Inspection" = 3,
+                   "Traffic Signal Repair" = 4,
+                   "Traffic Signal" = 4,
+                   "Illegal Parking" = 4,
+                   "Street Light Knock Downs" = 4,
+                   "Water in Gas (High Priority)" = 4,
+                   "Sidewalk Not Shoveled" = 5,
+                   "Street Lights" = 5,
+                   "Broken Sidewalk" = 5,
+                   "City/Snow Snow Issues" = 5)
+
+# Use a subquery to join the cleaning data with the rating values
+df_with_rating <- sqldf("SELECT df.*,
+                              CASE 
+                                WHEN TYPE = 'Catchbasin' THEN 1
+                                WHEN TYPE = 'Bridge Maintenance' THEN 1
+                                WHEN TYPE = 'Fire Hydrant' THEN 1
+                                WHEN TYPE = 'Damaged Sign' THEN 2
+                                WHEN TYPE = 'Park Lights' THEN 2
+                                WHEN TYPE = 'Upgrade Existing Lighting' THEN 2
+                                WHEN TYPE = 'Dead Animal Pick-up' THEN 2
+                                WHEN TYPE = 'Pigeon Infestation' THEN 2
+                                WHEN TYPE = 'Install New Lighting' THEN 2
+                                WHEN TYPE = 'Roadway Repair' THEN 3
+                                WHEN TYPE = 'Roadway Plowing/Salting' THEN 3
+                                WHEN TYPE = 'Sidewalk Cover/Manhole' THEN 3
+                                WHEN TYPE = 'Sidewalk (Internal)' THEN 3
+                                WHEN TYPE = 'Sidewalk' THEN 3
+                                WHEN TYPE = 'Pavement Marking Inspection' THEN 3
+                                WHEN TYPE = 'Traffic Signal Repair' THEN 4
+                                WHEN TYPE = 'Traffic Signal' THEN 4
+                                WHEN TYPE = 'Illegal Parking' THEN 4
+                                WHEN TYPE = 'Street Light Knock Downs' THEN 4
+                                WHEN TYPE = 'Water in Gas (High Priority)' THEN 4
+                                WHEN TYPE = 'Sidewalk Not Shoveled' THEN 5
+                                WHEN TYPE = 'Street Lights' THEN 5
+                                WHEN TYPE = 'Broken Sidewalk' THEN 5
+                                WHEN TYPE = 'City/Snow Snow Issues' THEN 5
+                                ELSE 0
+                              END AS Pedestrian_Danger_Rating
+                              FROM df")
+
+df <- df_with_rating
+```
+
+
+```{r PDR map}
+# map of pedestrian danger rating (including 0 values)
+boston <- get_map(location = "Boston", zoom = 12)
+ggplot(df, aes(x = longitude, y = latitude)) + 
+  geom_point(aes(color = Pedestrian_Danger_Rating)) +
+  scale_color_gradient(low = "green", high = "red") +
+  labs(x = "Longitude", y = "Latitude", color = "Pedestrian Danger Rating")
+
+
+```
+
+```{r map without 0s}
+
+boston <- get_map(location = "Boston", zoom = 12)
+
+ggplot(subset(df, Pedestrian_Danger_Rating >= 1 & Pedestrian_Danger_Rating <= 5), aes(x = longitude, y = latitude)) + 
+  geom_point(aes(color = Pedestrian_Danger_Rating)) +
+  scale_color_gradient(low = "green", high = "red") +
+  labs(x = "Longitude", y = "Latitude", color = "Pedestrian Danger Rating")
+
+```
+
+```{r duration vs cl month}
+
+ggplot(data = df, aes(x = case_duration, y = op_month)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Case duration vs CL month", x = "Case duration", y = "CL month")
+
+```
+
+
+```{r heatmap of case duration vs month}
+
+#range(df$case_duration)
+df_count <- df %>%
+  group_by(op_month, case_duration) %>%
+  summarize(num_reports = n())
+
+head(df_count)
+ggplot(data = df_count, aes(x = round(case_duration/100)*100, y = op_month, fill = num_reports)) +
+  geom_tile() +
+  scale_fill_gradient(low = "blue", high = "red", limits = c(0,7.5)) +
+  labs(title = "Number of reports by case duration and CL month", x = "Case duration", y = "CL month", fill = "Num reports")
+
+```
+
+```{r corr}
+
+vars <- c("case_duration", "longitude", "latitude", "op_hour", "cl_hour", "Pedestrian_Danger_Rating")
+
+#correlations <- cor(df[,vars])
+#View(head(df))
+#View(correlations)
+ggpairs(df[,vars])
+
+```
+
